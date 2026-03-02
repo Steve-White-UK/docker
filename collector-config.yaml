@@ -1,0 +1,30 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+
+exporters:
+  otlp/dash0:
+    endpoint: ${DASH0_ENDPOINT}
+    headers:
+      Authorization: Bearer ${DASH0_AUTH_TOKEN}
+      Dash0-Dataset: ${DASH0_DATASET}
+
+processors:
+  batch:
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/dash0]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/dash0]
+
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/dash0]

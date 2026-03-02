@@ -1,0 +1,312 @@
+services:
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    restart: always
+    command: ["--config=/etc/collector-config.yaml"]
+    environment:
+      - DASH0_AUTH_TOKEN=${DASH0_AUTH_TOKEN}
+      - DASH0_DATASET=${DASH0_DATASET}
+      - DASH0_ENDPOINT=${DASH0_ENDPOINT}
+    volumes:
+      - ./collector-config.yaml:/etc/collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+    networks:
+      - solana-network
+
+  # Kafka Infrastructure
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - solana-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9094:9094"
+      - "29094:29094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29094,PLAINTEXT_HOST://localhost:9094
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-broker-api-versions --bootstrap-server localhost:9094",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - solana-network
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo 'Creating Kafka topics...'
+
+        kafka-topics --create --bootstrap-server kafka:29094 \
+          --topic solana-api.indexer.v2 \
+          --partitions 24 \
+          --replication-factor 1 \
+          --config cleanup.policy=compact,delete \
+          --config compression.type=lz4 \
+          --config min.insync.replicas=1 || echo 'Topic solana-api.indexer.v2 already exists'
+
+        echo 'Kafka topics created successfully'
+    restart: "no"
+    networks:
+      - solana-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: solana_pools
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29094
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_CLUSTERS_0_AUDIT_TOPICAUDITENABLED: "true"
+      KAFKA_CLUSTERS_0_AUDIT_CONSOLEAUDITENABLED: "true"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:8080 || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - solana-network
+
+  # FalkorDB Graph Database
+  falkordb:
+    image: falkordb/falkordb:v4.16.0-arm64v8
+    platform: linux/arm64
+    container_name: solana-falkordb
+    ports:
+      - "6379:6379"
+      - "3000:3000"
+    environment:
+      - REDIS_ARGS=--save 60 1000 --appendonly yes --maxmemory 25gb --maxmemory-policy allkeys-lru
+    volumes:
+      - falkordb_data:/data
+    command: >
+      redis-server 
+      --loadmodule /usr/lib/redis/modules/libgraph.so
+        QUERY_MEM_CAPACITY 1048576
+        MAX_QUEUED_QUERIES 0
+        TIMEOUT 30000
+      --save 60 1000
+      --appendonly yes
+      --maxmemory 25gb
+      --maxmemory-policy allkeys-lru
+      --bind 0.0.0.0
+      --maxclients 65000
+      --timeout 300
+      --tcp-keepalive 60
+      --tcp-backlog 511
+      --databases 16
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - solana-network
+
+  # Application services
+  solana-pool-indexer:
+    build:
+      context: ../0x-solana
+      dockerfile: Dockerfile.local
+      args:
+        SERVICE_NAME: solana_pool_indexer
+        BUILD_MODE: release
+      secrets:
+        - CARGO_REGISTRIES_ZEROEXPROJECT_TOKEN
+    env_file:
+      - ./env/solana-pool-indexer.env
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+
+    environment:
+      # Point indexer at local Kafka inside the Docker network.
+      KAFKA_BROKERS: kafka:29094
+      # Optional network label; override via Doppler if needed.
+      SOLANA_NETWORK: ${SOLANA_NETWORK:-mainnet}
+    ports:
+      - "${SOLANA_POOL_INDEXER_HOST_PORT:-3100}:3000"
+    networks:
+      - solana-network
+
+  solana-pool-store-writer:
+    build:
+      context: ../0x-solana
+      dockerfile: Dockerfile.local
+      args:
+        SERVICE_NAME: solana_pool_store_writer
+        BUILD_MODE: release
+      secrets:
+        - CARGO_REGISTRIES_ZEROEXPROJECT_TOKEN
+    env_file:
+      - ./env/solana-pool-store-writer.env
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      falkordb:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    environment:
+      KAFKA_BROKERS: kafka:29094
+      SOLANA_NETWORK: ${SOLANA_NETWORK:-mainnet}
+    ports:
+      - "${SOLANA_POOL_STORE_WRITER_HOST_PORT:-3102}:3000"
+    networks:
+      - solana-network
+
+  solana-pool-store-service:
+    build:
+      context: ../0x-solana
+      dockerfile: Dockerfile.local
+      args:
+        SERVICE_NAME: solana_pool_store_service
+        BUILD_MODE: release
+      secrets:
+        - CARGO_REGISTRIES_ZEROEXPROJECT_TOKEN
+    env_file:
+      - ./env/solana-pool-store-service.env
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      falkordb:
+        condition: service_healthy
+      otel-collector:
+          condition: service_started
+    environment:
+      KAFKA_BROKERS: kafka:29094
+      SOLANA_NETWORK: ${SOLANA_NETWORK:-mainnet}
+
+    ports:
+      - "${POOL_STORE_GRPC_HOST_PORT:-50051}:50051"
+      - "${POOL_STORE_HEALTH_HOST_PORT:-3103}:3000"
+    networks:
+      - solana-network
+
+  solana-api:
+    build:
+      context: ../0x-solana
+      dockerfile: Dockerfile.local
+      args:
+        SERVICE_NAME: solana_api
+        BUILD_MODE: release
+      secrets:
+        - CARGO_REGISTRIES_ZEROEXPROJECT_TOKEN
+    env_file:
+      - ./env/solana-api.env
+    depends_on:
+      solana-pool-store-service:
+        condition: service_started
+      falkordb:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    environment:
+      # Solana RPC URLs and other secrets are expected to come from Doppler or your shell env.
+      # Here we only set local infra wiring.
+      REDIS_POOL_STORE_URL: redis://falkordb:6379
+      GRAPH_SERVICE_POOL_STORE_URL: http://solana-pool-store-service:50051
+      HTTP_PORT: 3010
+    ports:
+      - "${SOLANA_API_HOST_PORT:-3010}:3010"
+    networks:
+      - solana-network
+
+  solana-api-gateway:
+    build:
+      context: ../0x-solana
+      dockerfile: Dockerfile.local
+      args:
+        SERVICE_NAME: solana_api_gateway
+        BUILD_MODE: release
+      secrets:
+        - CARGO_REGISTRIES_ZEROEXPROJECT_TOKEN
+    env_file:
+      - ./env/solana-api-gateway.env
+    depends_on:
+      kafka:
+        condition: service_healthy
+      solana-api:
+        condition: service_started
+    environment:
+      # HTTP server and metrics ports inside the container.
+      HTTP_PORT: 3001
+      METRICS_PORT: 8080
+      # Point gateway at the solana-api service running in Docker.
+      TARGET_SERVICE_URL: http://solana-api:3010/swap-instructions
+      # Kafka wiring to local Kafka broker.
+      KAFKA_BOOTSTRAP: kafka:29094
+      # Topic name can be overridden via env; this default is safe for local dev.
+      KAFKA_TOPIC: ${SOLANA_API_GATEWAY_KAFKA_TOPIC:-solana-api.gateway.requests.raw.v0}
+    ports:
+      - "${SOLANA_API_GATEWAY_HOST_PORT:-3001}:3001"
+      # Expose metrics on a configurable host port to avoid clashing with kafka-ui (8080).
+      - "${SOLANA_API_GATEWAY_METRICS_HOST_PORT:-8081}:8080"
+    networks:
+      - solana-network
+
+secrets:
+  CARGO_REGISTRIES_ZEROEXPROJECT_TOKEN:
+    environment: CARGO_REGISTRIES_ZEROEXPROJECT_TOKEN
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  falkordb_data:
+
+networks:
+  solana-network:
+    name: solana-network
